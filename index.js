@@ -6,12 +6,23 @@ import express from 'express';
 const PORT = Number(process.env.PORT) || 3000;
 const VK_API_VERSION = '5.199';
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 час
+const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // 30 минут
 const MAX_BRIDGES = 50;
+
+const CHROME_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const WEB_TOKEN_ENDPOINTS = [
+  { url: 'https://login.vk.ru/?act=web_token&version=1&app_id=8202606', appId: '8202606', label: 'login.vk.ru (8202606)' },
+  { url: 'https://login.vk.ru/?act=web_token&version=1&app_id=6287487', appId: '6287487', label: 'login.vk.ru (6287487)' },
+  { url: 'https://login.vk.com/?act=web_token&version=1&app_id=8202606', appId: '8202606', label: 'login.vk.com (8202606)' },
+  { url: 'https://login.vk.com/?act=web_token&version=1&app_id=6287487', appId: '6287487', label: 'login.vk.com (6287487)' },
+];
 
 const startedAt = Date.now();
 let totalSentAll = 0;
 
-// Активные подключения: sessionId -> BridgeInstance
+// Активные подключения: sessionId -> UserVkBridge
 const bridges = new Map();
 
 // ---------------- Вспомогательные функции ----------------
@@ -34,8 +45,17 @@ function isValidBarkKey(key) {
   return /^[a-zA-Z0-9_-]{4,128}$/.test(key);
 }
 
-function isValidVkToken(token) {
-  return typeof token === 'string' && token.length >= 20 && token.length <= 512 && !/\s/.test(token);
+// Очищаем случайно скопированный префикс "Cookie:" и переносы строк (защита от невалидных заголовков)
+function normalizeVkCookie(raw) {
+  return String(raw || '')
+    .replace(/^cookie\s*:\s*/i, '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .trim();
+}
+
+function isValidVkCookie(cookie) {
+  return typeof cookie === 'string' && cookie.length >= 16 && cookie.length <= 16384 && cookie.includes('=');
 }
 
 function safeHttpsUrl(url) {
@@ -111,6 +131,74 @@ function sleep(ms, signal) {
   });
 }
 
+// ---------------- Получение web_token ВКонтакте по Cookie ----------------
+
+async function refreshVkToken(cookie, signal) {
+  const cleanCookie = normalizeVkCookie(cookie);
+  if (!isValidVkCookie(cleanCookie)) {
+    throw new Error('Некорректная строка VK_COOKIE (ожидается заголовок cookie из web.vk.me)');
+  }
+
+  const errors = [];
+
+  for (const target of WEB_TOKEN_ENDPOINTS) {
+    try {
+      const timeoutSignal = AbortSignal.timeout(15_000);
+      const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
+      const body = new URLSearchParams({
+        version: '1',
+        app_id: target.appId,
+      });
+
+      const res = await fetch(target.url, {
+        method: 'POST',
+        headers: {
+          Cookie: cleanCookie,
+          Origin: 'https://web.vk.me',
+          Referer: 'https://web.vk.me/',
+          'User-Agent': CHROME_USER_AGENT,
+          Accept: 'application/json, text/plain, */*',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        },
+        body: body.toString(),
+        signal: combinedSignal,
+      });
+
+      const rawText = await res.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        // Ответ не JSON (например, HTML-страница ошибки или редирект)
+      }
+
+      const accessToken = parsed?.data?.access_token || parsed?.access_token;
+      if (res.ok && typeof accessToken === 'string' && accessToken.length > 10) {
+        return {
+          accessToken,
+          source: target.label,
+          expires: parsed?.data?.expires || null,
+          userId: parsed?.data?.user_id || null,
+        };
+      }
+
+      const snippet = rawText.replace(/\s+/g, ' ').trim().slice(0, 320);
+      const errDetail = `${target.label} -> HTTP ${res.status}: ${snippet || 'пустой ответ'}`;
+      console.error(`[web_token ERROR] ${errDetail}`);
+      errors.push(errDetail);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      const errDetail = `${target.label} -> ${err instanceof Error ? err.message : String(err)}`;
+      console.error(`[web_token ERROR] ${errDetail}`);
+      errors.push(errDetail);
+    }
+  }
+
+  // Возвращаем точный ответ от login.vk.ru (и запасных), чтобы причина была сразу видна в интерфейсе
+  throw new Error(`Не удалось получить web_token по VK_COOKIE. Ответ сервера: ${errors[0] || 'неизвестная ошибка'}`);
+}
+
 // ---------------- Встроенный генератор ZIP (без сторонних пакетов) ----------------
 
 const CRC_TABLE = new Uint32Array(256);
@@ -141,29 +229,27 @@ function createZipBuffer(files) {
     const checksum = crc32(dataBuf);
     const size = dataBuf.length;
 
-    // Local File Header (30 bytes + filename)
     const localHeader = Buffer.alloc(30);
-    localHeader.writeUInt32LE(0x04034b50, 0); // signature
-    localHeader.writeUInt16LE(20, 4); // version needed
-    localHeader.writeUInt16LE(0x0800, 6); // UTF-8 filename flag
-    localHeader.writeUInt16LE(0, 8); // compression method: 0 (store)
-    localHeader.writeUInt16LE(0, 10); // mod time
-    localHeader.writeUInt16LE(0, 12); // mod date
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(0, 8);
+    localHeader.writeUInt16LE(0, 10);
+    localHeader.writeUInt16LE(0, 12);
     localHeader.writeUInt32LE(checksum, 14);
     localHeader.writeUInt32LE(size, 18);
     localHeader.writeUInt32LE(size, 22);
     localHeader.writeUInt16LE(nameBuf.length, 26);
-    localHeader.writeUInt16LE(0, 28); // extra len
+    localHeader.writeUInt16LE(0, 28);
 
     localParts.push(localHeader, nameBuf, dataBuf);
 
-    // Central Directory Header (46 bytes + filename)
     const centralHeader = Buffer.alloc(46);
-    centralHeader.writeUInt32LE(0x02014b50, 0); // signature
-    centralHeader.writeUInt16LE(20, 4); // version made by
-    centralHeader.writeUInt16LE(20, 6); // version needed
-    centralHeader.writeUInt16LE(0x0800, 8); // UTF-8 flag
-    centralHeader.writeUInt16LE(0, 10); // method: store
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(0, 10);
     centralHeader.writeUInt16LE(0, 12);
     centralHeader.writeUInt16LE(0, 14);
     centralHeader.writeUInt32LE(checksum, 16);
@@ -183,7 +269,7 @@ function createZipBuffer(files) {
 
   const centralDirBuf = Buffer.concat(centralParts);
   const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0); // End of Central Directory signature
+  eocd.writeUInt32LE(0x06054b50, 0);
   eocd.writeUInt16LE(0, 4);
   eocd.writeUInt16LE(0, 6);
   eocd.writeUInt16LE(files.length, 8);
@@ -242,14 +328,20 @@ async function sendBarkPush(barkKey, { title, body, icon, url, group }) {
   return latencyMs;
 }
 
-// ---------------- Класс одного подключения VK -> Bark ----------------
+// ---------------- Класс одного подключения VK (web_token) -> Bark ----------------
 
 class UserVkBridge {
-  constructor({ sessionId, vkToken, barkKey, isEnvDefault = false }) {
+  constructor({ sessionId, vkCookie, barkKey, isEnvDefault = false }) {
     this.sessionId = sessionId;
-    this.vkToken = vkToken;
+    this.vkCookie = normalizeVkCookie(vkCookie);
     this.barkKey = barkKey;
     this.isEnvDefault = isEnvDefault;
+
+    this.accessToken = '';
+    this.tokenSource = null;
+    this.tokenUpdatedAt = null;
+    this.refreshPromise = null;
+    this.refreshTimer = null;
 
     this.status = 'connecting'; // 'active' | 'connecting' | 'error' | 'stopped'
     this.error = null;
@@ -279,10 +371,50 @@ class UserVkBridge {
     this.cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
   }
 
-  async callVkApi(method, params = {}) {
+  // Обновляет web_token по VK_COOKIE (защита от параллельных повторных вызовов)
+  async refreshToken() {
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.refreshPromise = (async () => {
+      const result = await refreshVkToken(this.vkCookie, this.abortController.signal);
+      this.accessToken = result.accessToken;
+      this.tokenSource = result.source;
+      this.tokenUpdatedAt = Date.now();
+      if (result.userId && !this.vkUserId) {
+        this.vkUserId = Number(result.userId);
+      }
+      console.log(`[web_token OK] Обновлен токен через ${result.source}`);
+      return this.accessToken;
+    })().finally(() => {
+      this.refreshPromise = null;
+    });
+
+    return this.refreshPromise;
+  }
+
+  startRefreshTimer() {
+    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.refreshTimer = setInterval(() => {
+      if (this.abortController.signal.aborted) return;
+      this.refreshToken().catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[web_token AUTO-REFRESH ERROR] ${msg}`);
+        this.error = msg;
+      });
+    }, TOKEN_REFRESH_INTERVAL_MS);
+  }
+
+  // Вызов https://api.vk.ru/method/... с тем же User-Agent и автообновлением при ошибке 5
+  async callVkApi(method, params = {}, allowTokenRetry = true) {
+    if (!this.accessToken) {
+      await this.refreshToken();
+    }
+
     const form = new URLSearchParams({
       v: VK_API_VERSION,
-      access_token: this.vkToken,
+      access_token: this.accessToken,
     });
     for (const [k, v] of Object.entries(params)) {
       form.set(k, String(v));
@@ -293,9 +425,14 @@ class UserVkBridge {
       AbortSignal.timeout(15_000),
     ]);
 
-    const res = await fetch(`https://api.vk.com/method/${method}`, {
+    const res = await fetch(`https://api.vk.ru/method/${method}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8',
+        'User-Agent': CHROME_USER_AGENT,
+        Origin: 'https://web.vk.me',
+        Referer: 'https://web.vk.me/',
+      },
       body: form.toString(),
       signal: combinedSignal,
     });
@@ -306,11 +443,18 @@ class UserVkBridge {
 
     const data = await res.json();
     if (data.error) {
+      // Код 5 — истекший токен: автоматически обновляем web_token и повторяем запрос 1 раз
+      if (data.error.error_code === 5 && allowTokenRetry) {
+        console.log(`[VK API] Получена ошибка 5 (${method}) — обновляю web_token по Cookie…`);
+        await this.refreshToken();
+        return this.callVkApi(method, params, false);
+      }
+
       if (data.error.error_code === 5) {
-        throw new Error('Неверный или истекший VK_TOKEN (код 5)');
+        throw new Error('VK API ошибка 5: токен не принят даже после обновления по VK_COOKIE');
       }
       if (data.error.error_code === 15) {
-        throw new Error('У токена нет прав на чтение сообщений (код 15). Выберите Kate Mobile или VK Me.');
+        throw new Error(`VK API ошибка 15 (${method}): ${data.error.error_msg}`);
       }
       throw new Error(`VK API ошибка ${data.error.error_code}: ${data.error.error_msg}`);
     }
@@ -426,7 +570,8 @@ class UserVkBridge {
   }
 
   async verifyAndStart() {
-    // Проверяем токен и права на messages.getLongPollServer до возврата ответа пользователю
+    await this.refreshToken();
+
     const [me, lp] = await Promise.all([
       this.callVkApi('users.get'),
       this.callVkApi('messages.getLongPollServer', { lp_version: 3, need_pts: 0 }),
@@ -445,10 +590,12 @@ class UserVkBridge {
 
     this.status = 'active';
     this.error = null;
+    this.startRefreshTimer();
     this.runLoop(initialCreds);
   }
 
   startBackground() {
+    this.startRefreshTimer();
     this.runLoop(null);
   }
 
@@ -457,20 +604,25 @@ class UserVkBridge {
     let retryDelayMs = 2000;
     const signal = this.abortController.signal;
 
-    if (!this.accountName) {
-      try {
-        const me = await this.callVkApi('users.get');
-        if (me?.[0]) {
-          this.vkUserId = me[0].id;
-          this.accountName = `${me[0].first_name} ${me[0].last_name}`.trim();
-        }
-      } catch {
-        // обработается в основном цикле
-      }
-    }
-
     while (!signal.aborted) {
       try {
+        if (!this.accessToken) {
+          this.status = 'connecting';
+          await this.refreshToken();
+        }
+
+        if (!this.accountName) {
+          try {
+            const me = await this.callVkApi('users.get');
+            if (me?.[0]) {
+              this.vkUserId = me[0].id;
+              this.accountName = `${me[0].first_name} ${me[0].last_name}`.trim();
+            }
+          } catch {
+            // не критично
+          }
+        }
+
         if (!creds) {
           this.status = 'connecting';
           const lp = await this.callVkApi('messages.getLongPollServer', {
@@ -485,6 +637,7 @@ class UserVkBridge {
           this.status = 'active';
           this.error = null;
           retryDelayMs = 2000;
+          console.log(`[VK Long Poll] Подключено (${this.accountName || 'аккаунт'})`);
         }
 
         const pollUrl = new URL(`https://${creds.server}`);
@@ -496,6 +649,11 @@ class UserVkBridge {
         pollUrl.searchParams.set('version', '3');
 
         const res = await fetch(pollUrl.toString(), {
+          headers: {
+            'User-Agent': CHROME_USER_AGENT,
+            Origin: 'https://web.vk.me',
+            Referer: 'https://web.vk.me/',
+          },
           signal: AbortSignal.any([signal, AbortSignal.timeout(35_000)]),
         });
 
@@ -523,6 +681,7 @@ class UserVkBridge {
             };
             continue;
           }
+          // failed: 3 или 4 — переподключаем Long Poll (и при необходимости обновим web_token)
           creds = null;
           continue;
         }
@@ -544,12 +703,17 @@ class UserVkBridge {
       } catch (err) {
         if (signal.aborted) break;
         const message = err instanceof Error ? err.message : 'Сетевая ошибка Long Poll';
+        console.error(`[VK Long Poll ERROR] ${message}`);
         this.status = 'error';
         this.error = message;
         creds = null;
 
-        const isAuthError = message.includes('(код 5)') || message.includes('(код 15)');
-        await sleep(isAuthError ? 60_000 : retryDelayMs, signal);
+        // Если проблема с токеном — сбрасываем его, чтобы на следующей попытке заново запросить web_token
+        if (message.includes('ошибка 5') || message.includes('web_token')) {
+          this.accessToken = '';
+        }
+
+        await sleep(retryDelayMs, signal);
         retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
       }
     }
@@ -557,6 +721,10 @@ class UserVkBridge {
 
   stop() {
     this.status = 'stopped';
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
     this.abortController.abort();
   }
 
@@ -565,21 +733,23 @@ class UserVkBridge {
       status: this.status,
       error: this.error,
       accountName: this.accountName,
+      tokenSource: this.tokenSource,
+      tokenUpdatedAt: this.tokenUpdatedAt,
       sentCount: this.sentCount,
       uptimeMs: Date.now() - this.connectedAt,
     };
   }
 }
 
-// Автозапуск дефолтного моста, если VK_TOKEN и BARK_KEY заданы в Environment Variables (Render.com)
-const ENV_VK_TOKEN = (process.env.VK_TOKEN || '').trim();
+// Автозапуск дефолтного моста, если в Render Environment Variables заданы VK_COOKIE и BARK_KEY
+const ENV_VK_COOKIE = normalizeVkCookie(process.env.VK_COOKIE);
 const ENV_BARK_KEY = extractBarkKey(process.env.BARK_KEY);
 let envBridge = null;
 
-if (isValidVkToken(ENV_VK_TOKEN) && isValidBarkKey(ENV_BARK_KEY)) {
+if (isValidVkCookie(ENV_VK_COOKIE) && isValidBarkKey(ENV_BARK_KEY)) {
   envBridge = new UserVkBridge({
     sessionId: 'env-default',
-    vkToken: ENV_VK_TOKEN,
+    vkCookie: ENV_VK_COOKIE,
     barkKey: ENV_BARK_KEY,
     isEnvDefault: true,
   });
@@ -591,7 +761,7 @@ if (isValidVkToken(ENV_VK_TOKEN) && isValidBarkKey(ENV_BARK_KEY)) {
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '64kb' }));
 
 function getSessionFromHeader(req) {
   const auth = req.headers.authorization || '';
@@ -606,7 +776,7 @@ app.get('/ping', (_req, res) => {
   res.type('text/plain').send('OK');
 });
 
-// 2. Кнопка скачивания готового ZIP-архива (ровно 2 файла: package.json и index.js)
+// 2. Скачивание готового ZIP-архива (ровно 2 файла: package.json и index.js)
 app.get('/download/zip', (_req, res) => {
   try {
     const rootDir = process.cwd();
@@ -622,12 +792,12 @@ app.get('/download/zip', (_req, res) => {
     res.setHeader('Content-Disposition', 'attachment; filename="vk-bark-bridge.zip"');
     res.setHeader('Content-Length', String(zipBuf.length));
     res.send(zipBuf);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Не удалось собрать ZIP-архив' });
   }
 });
 
-// 3. Общий статус сервера + личный статус сессии (если передан Bearer sessionId)
+// 3. Общий статус сервера + личный статус сессии (без утечки Cookie/токенов)
 app.get('/api/status', (req, res) => {
   const sessionBridge = getSessionFromHeader(req);
   const activeCount = Array.from(bridges.values()).filter((b) => b.status === 'active').length;
@@ -642,14 +812,16 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-// 4. Подключение нового пользователя прямо через сайт (ввод своих VK_TOKEN и BARK_KEY)
+// 4. Подключение через сайт (ввод VK_COOKIE и BARK_KEY)
 app.post('/api/connect', async (req, res) => {
   try {
-    const vkToken = String(req.body?.vkToken || '').trim();
+    const vkCookie = normalizeVkCookie(req.body?.vkCookie);
     const barkKey = extractBarkKey(req.body?.barkKey);
 
-    if (!isValidVkToken(vkToken)) {
-      res.status(400).json({ error: 'Введите корректный VK_TOKEN (начинается с vk1.a....)' });
+    if (!isValidVkCookie(vkCookie)) {
+      res.status(400).json({
+        error: 'Введите корректный заголовок VK_COOKIE из запроса web_token на сайте web.vk.me',
+      });
       return;
     }
     if (!isValidBarkKey(barkKey)) {
@@ -658,18 +830,17 @@ app.post('/api/connect', async (req, res) => {
     }
     if (bridges.size >= MAX_BRIDGES) {
       res.status(429).json({
-        error: 'Достигнут лимит активных подключений на этом сервере. Скачайте ZIP и запустите свою копию на Render.',
+        error: 'Достигнут лимит активных подключений на сервере. Скачайте ZIP и запустите свою копию на Render.',
       });
       return;
     }
 
     const sessionId = crypto.randomBytes(24).toString('hex');
-    const instance = new UserVkBridge({ sessionId, vkToken, barkKey });
+    const instance = new UserVkBridge({ sessionId, vkCookie, barkKey });
 
-    // Проверяем токен прямо сейчас, чтобы пользователь сразу увидел результат или точную ошибку
     await instance.verifyAndStart();
 
-    // Если этот же аккаунт ВК уже был подключен ранее — останавливаем дубликат
+    // Если этот же аккаунт ВК уже подключен — останавливаем старый дубликат
     if (instance.vkUserId) {
       for (const [oldId, existing] of bridges.entries()) {
         if (!existing.isEnvDefault && existing.vkUserId === instance.vkUserId) {
@@ -738,7 +909,7 @@ app.post('/api/test', async (req, res) => {
   }
 });
 
-// 7. Главная страница: ввод ключей, статус, скачивание ZIP и подробная инструкция прямо на сайте
+// 7. Главная страница: ввод VK_COOKIE + BARK_KEY, статус, ZIP и пошаговая инструкция
 app.get('/', (_req, res) => {
   const html = `<!doctype html>
 <html lang="ru">
@@ -816,7 +987,7 @@ app.get('/', (_req, res) => {
       padding: 28px 20px 64px;
     }
     .hero {
-      max-width: 680px;
+      max-width: 700px;
       margin-bottom: 24px;
     }
     .hero h1 {
@@ -846,6 +1017,17 @@ app.get('/', (_req, res) => {
       font-size: 15px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
+    }
+    .env-error {
+      display: none;
+      margin-bottom: 20px;
+      padding: 13px 16px;
+      border-radius: 14px;
+      background: rgba(255, 69, 58, 0.12);
+      border: 1px solid rgba(255, 69, 58, 0.3);
+      color: #FF8A80;
+      font-size: 13px;
+      word-break: break-word;
     }
     .grid {
       display: grid;
@@ -882,7 +1064,7 @@ app.get('/', (_req, res) => {
     }
     input[type="text"], input[type="password"] {
       width: 100%;
-      padding: 11px 42px 11px 13px;
+      padding: 11px 76px 11px 13px;
       border-radius: 11px;
       border: 1px solid rgba(255, 255, 255, 0.12);
       background: #242426;
@@ -904,7 +1086,7 @@ app.get('/', (_req, res) => {
       border: none;
       color: #8E8E93;
       cursor: pointer;
-      padding: 6px;
+      padding: 6px 8px;
       font-size: 12px;
       border-radius: 7px;
     }
@@ -951,6 +1133,7 @@ app.get('/', (_req, res) => {
       font-size: 13px;
       line-height: 1.45;
       min-height: 18px;
+      word-break: break-word;
     }
     .msg.ok { color: #30D158; }
     .msg.err { color: #FF453A; }
@@ -1004,9 +1187,7 @@ app.get('/', (_req, res) => {
       word-break: break-all;
     }
     .hl { color: #30D158; font-weight: 600; }
-    .deploy-card {
-      margin-top: 24px;
-    }
+    .deploy-card { margin-top: 24px; }
     .deploy-grid {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1052,14 +1233,14 @@ app.get('/', (_req, res) => {
     <section class="hero">
       <h1>Нативные Push-уведомления ВКонтакте на iPhone</h1>
       <p>
-        Подключите свой аккаунт ВК и приложение <strong>Bark</strong> прямо здесь — новые сообщения будут мгновенно приходить на iPhone через родной Apple APNs и при нажатии открывать приложение ВК (<span class="mono">vk://</span>), а не Safari.
+        Работает через официальный <span class="mono">web_token</span> веб-мессенджера <span class="mono">web.vk.me</span> с автообновлением каждые 30 минут. Уведомления приходят через Bark APNs и сразу открывают приложение ВК (<span class="mono">vk://</span>), минуя Safari.
       </p>
     </section>
 
     <section class="status-strip" aria-label="Статус сервера">
       <div>
-        <div class="stat-label">Статус сервера</div>
-        <div id="srvStatus" class="stat-val" style="color:#30D158">🟢 Работает</div>
+        <div class="stat-label">Статус моста</div>
+        <div id="srvStatus" class="stat-val" style="color:#FF9F0A">🟡 Ожидает ключи</div>
       </div>
       <div>
         <div class="stat-label">Активных подключений</div>
@@ -1075,29 +1256,31 @@ app.get('/', (_req, res) => {
       </div>
     </section>
 
+    <div id="envErrorBox" class="env-error"></div>
+
     <div class="grid">
-      <!-- Левая колонка: ввод ключей для любого пользователя -->
+      <!-- Левая колонка: ввод VK_COOKIE и BARK_KEY -->
       <section id="connect" class="card">
         <div class="card-head">
           <h2>Подключить свой iPhone</h2>
-          <p>Введите ваши ключи (где их взять за 1 минуту — справа в инструкции).</p>
+          <p>Введите <span class="mono">BARK_KEY</span> и <span class="mono">VK_COOKIE</span> (инструкция справа).</p>
         </div>
         <div class="card-body">
           <div class="field">
             <label for="barkKey">1. BARK_KEY (ключ из приложения Bark на iPhone)</label>
             <div class="input-wrap">
-              <input id="barkKey" type="text" autocomplete="off" spellcheck="false" placeholder="Например: AbCdEf123456 или вся ссылка https://api.day.app/..." />
+              <input id="barkKey" type="text" autocomplete="off" spellcheck="false" style="padding-right:13px" placeholder="Например: AbCdEf123456 или ссылка https://api.day.app/..." />
             </div>
             <div class="hint">Можно вставить всю ссылку из Bark — ключ вырежется автоматически.</div>
           </div>
 
           <div class="field">
-            <label for="vkToken">2. VK_TOKEN (токен ВКонтакте с доступом к сообщениям)</label>
+            <label for="vkCookie">2. VK_COOKIE (заголовок cookie из запроса web_token на web.vk.me)</label>
             <div class="input-wrap">
-              <input id="vkToken" type="password" autocomplete="off" spellcheck="false" placeholder="vk1.a.xxxxxxxxxxxxxxxxxxxxxxxx..." />
-              <button id="toggleVk" type="button" class="eye-btn">Показать</button>
+              <input id="vkCookie" type="password" autocomplete="off" spellcheck="false" placeholder="remixdsid=...; remixnsid=...; remixsid=..." />
+              <button id="toggleCookie" type="button" class="eye-btn">Показать</button>
             </div>
-            <div class="hint">Хранится только в оперативной памяти сервера для Long Poll и никому не показывается.</div>
+            <div class="hint">Токен обновляется автоматически каждые 30 минут и при истечении (код 5).</div>
           </div>
 
           <div class="btn-row">
@@ -1117,6 +1300,10 @@ app.get('/', (_req, res) => {
               <span id="myAccount" style="font-weight:600">—</span>
             </div>
             <div class="session-row">
+              <span style="color:#98989F">Источник web_token</span>
+              <span id="mySource" class="mono" style="font-weight:500;color:#D1D1D6">—</span>
+            </div>
+            <div class="session-row">
               <span style="color:#98989F">Доставлено вам пушей</span>
               <span id="mySent" class="mono" style="font-weight:600">0</span>
             </div>
@@ -1128,44 +1315,43 @@ app.get('/', (_req, res) => {
         </div>
       </section>
 
-      <!-- Правая колонка: пошаговая инструкция прямо на сайте -->
+      <!-- Правая колонка: пошаговая инструкция по Bark и web.vk.me Cookie -->
       <section id="guide" class="card">
         <div class="card-head">
-          <h2>Инструкция: откуда взять 2 ключа</h2>
-          <p>Занимает 2 минуты прямо с iPhone или компьютера.</p>
+          <h2>Инструкция: откуда взять BARK_KEY и VK_COOKIE</h2>
+          <p>Работает в обход блокировки старых токенов vkhost.</p>
         </div>
         <ol class="steps">
           <li class="step">
             <div class="step-title">Шаг 1. Скачать Bark и взять BARK_KEY</div>
-            <p>Установите бесплатное приложение <strong>Bark</strong> из App Store, откройте его и нажмите <strong>«Разрешить уведомления»</strong>. На главном экране скопируйте ключ из ссылки:</p>
+            <p>Установите бесплатное приложение <strong>Bark</strong> из App Store на iPhone, откройте и разрешите уведомления. Скопируйте ключ из ссылки:</p>
             <div class="code-line">https://api.day.app/<span class="hl">AbCdEf123456GhIjKl</span>/текст</div>
-            <p style="margin-top:6px">Вставьте выделенную часть (или всю ссылку целиком) в поле <strong>BARK_KEY</strong> слева.</p>
           </li>
 
           <li class="step">
-            <div class="step-title">Шаг 2. Получить VK_TOKEN</div>
+            <div class="step-title">Шаг 2. Скопировать VK_COOKIE с web.vk.me</div>
             <ul>
-              <li>Откройте <a href="https://vkhost.github.io" target="_blank" rel="noopener noreferrer">vkhost.github.io</a> и выберите <strong>Kate Mobile</strong> (или <strong>VK Me</strong>).</li>
-              <li>Нажмите <strong>«Разрешить»</strong> в ВК — вас перекинет на пустую страницу.</li>
-              <li>Скопируйте из адресной строки всё между <span class="mono">access_token=</span> и <span class="mono">&amp;expires_in</span>:</li>
+              <li>Откройте в Chrome на компьютере <a href="https://web.vk.me" target="_blank" rel="noopener noreferrer">web.vk.me</a> и войдите в свой аккаунт ВК.</li>
+              <li>Нажмите <strong>F12</strong> → вкладка <strong>Network (Сеть)</strong> → в поле фильтра введите <span class="mono">web_token</span>.</li>
+              <li>Обновите страницу (<strong>F5</strong>), кликните на запрос <span class="mono">?act=web_token...</span>.</li>
+              <li>В блоке <strong>Request Headers</strong> найдите строку <span class="mono">cookie:</span> и скопируйте всё её значение целиком.</li>
             </ul>
-            <div class="code-line">...#access_token=<span class="hl">vk1.a.длинная_строка</span>&amp;expires_in=0...</div>
           </li>
 
           <li class="step">
             <div class="step-title">Шаг 3. Проверить переход в приложение ВК</div>
-            <p>Вставьте оба ключа в форму слева → нажмите <strong>«Тестовый пуш в Bark»</strong> → тапните по пришедшему пушу на iPhone. iOS сразу откроет родное приложение ВК (<span class="mono">vk://vk.com/im</span>) без Safari. Затем нажмите <strong>«Подключить уведомления»</strong>.</p>
+            <p>Вставьте <span class="mono">BARK_KEY</span> и <span class="mono">VK_COOKIE</span> в форму слева → нажмите <strong>«Тестовый пуш в Bark»</strong> → тапните по пушу на iPhone (откроется <span class="mono">vk://vk.com/im</span>). Затем нажмите <strong>«Подключить уведомления»</strong>.</p>
           </li>
         </ol>
       </section>
     </div>
 
-    <!-- Нижний блок: как скачать ZIP и запустить свой бесплатный сервер на Render.com -->
+    <!-- Нижний блок: деплой на бесплатный Render.com -->
     <section id="selfhost" class="card deploy-card">
       <div class="card-head" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px">
         <div>
           <h2>Запустить свою бесплатную копию 24/7 на Render.com</h2>
-          <p>Весь проект — ровно 2 файла (<span class="mono">package.json</span> и <span class="mono">index.js</span>). Скачайте архив и задеплойте за 2 минуты.</p>
+          <p>Всего 2 файла (<span class="mono">package.json</span> и <span class="mono">index.js</span>). Автозапуск по переменным <span class="mono">VK_COOKIE</span> и <span class="mono">BARK_KEY</span>.</p>
         </div>
         <a class="btn-zip" href="/download/zip" download="vk-bark-bridge.zip">
           ⬇ Скачать vk-bark-bridge.zip
@@ -1173,29 +1359,24 @@ app.get('/', (_req, res) => {
       </div>
       <div class="deploy-grid">
         <div class="deploy-col">
-          <h3>1. Залить архив на GitHub</h3>
+          <h3>1. Залить на GitHub</h3>
           <ol>
-            <li>Нажмите <strong>«Скачать vk-bark-bridge.zip»</strong> и распакуйте 2 файла.</li>
-            <li>На <a href="https://github.com" target="_blank" rel="noopener noreferrer">github.com</a> создайте новый <strong>Private</strong> репозиторий <span class="mono">vk-bark-bridge</span>.</li>
-            <li>Нажмите <strong>uploading an existing file</strong> и перетащите туда <span class="mono">package.json</span> и <span class="mono">index.js</span> → <strong>Commit changes</strong>.</li>
+            <li>Скачайте ZIP и загрузите <span class="mono">package.json</span> и <span class="mono">index.js</span> в приватный репозиторий на <a href="https://github.com" target="_blank" rel="noopener noreferrer">github.com</a>.</li>
           </ol>
         </div>
 
         <div class="deploy-col">
-          <h3>2. Деплой на Render.com (Free)</h3>
+          <h3>2. Деплой на Render (Free)</h3>
           <ol>
-            <li>На <a href="https://render.com" target="_blank" rel="noopener noreferrer">render.com</a> нажмите <strong>New + → Web Service</strong> и подключите репозиторий.</li>
-            <li><strong>Build Command:</strong> <span class="mono">npm install</span><br /><strong>Start Command:</strong> <span class="mono">npm start</span><br /><strong>Plan:</strong> Free ($0/month).</li>
-            <li>В <strong>Environment Variables</strong> (для автозапуска при старте) добавьте <span class="mono">VK_TOKEN</span> и <span class="mono">BARK_KEY</span> → <strong>Deploy</strong>.</li>
+            <li><strong>Build:</strong> <span class="mono">npm install</span> · <strong>Start:</strong> <span class="mono">npm start</span> · <strong>Plan:</strong> Free.</li>
+            <li>В <strong>Environment Variables</strong> добавьте <span class="mono">VK_COOKIE</span> и <span class="mono">BARK_KEY</span> — мост запустится сам сразу после старта сервера.</li>
           </ol>
         </div>
 
         <div class="deploy-col">
-          <h3>3. Чтобы сервер не засыпал (cron-job.org)</h3>
+          <h3>3. Пинг каждые 5 минут</h3>
           <ol>
-            <li>Зайдите на бесплатный <a href="https://cron-job.org" target="_blank" rel="noopener noreferrer">cron-job.org</a> → <strong>Create Cronjob</strong>.</li>
-            <li>Вставьте URL вашего сервера с <span class="mono">/ping</span> на конце (<a href="/ping" target="_blank" rel="noopener noreferrer">проверить /ping</a>).</li>
-            <li>Интервал: <strong>Every 5 minutes</strong> → <strong>Create</strong>. Сервер будет работать круглосуточно.</li>
+            <li>На <a href="https://cron-job.org" target="_blank" rel="noopener noreferrer">cron-job.org</a> создайте задачу раз в 5 минут на ваш URL + <span class="mono">/ping</span> (<a href="/ping" target="_blank" rel="noopener noreferrer">проверить</a>), чтобы Render не засыпал.</li>
           </ol>
         </div>
       </div>
@@ -1210,10 +1391,11 @@ app.get('/', (_req, res) => {
     const srvActiveEl = document.getElementById('srvActive');
     const srvSentEl = document.getElementById('srvSent');
     const srvUptimeEl = document.getElementById('srvUptime');
+    const envErrorBox = document.getElementById('envErrorBox');
 
     const barkKeyInput = document.getElementById('barkKey');
-    const vkTokenInput = document.getElementById('vkToken');
-    const toggleVkBtn = document.getElementById('toggleVk');
+    const vkCookieInput = document.getElementById('vkCookie');
+    const toggleCookieBtn = document.getElementById('toggleCookie');
     const connectBtn = document.getElementById('connectBtn');
     const testBtn = document.getElementById('testBtn');
     const disconnectBtn = document.getElementById('disconnectBtn');
@@ -1222,6 +1404,7 @@ app.get('/', (_req, res) => {
     const sessionBox = document.getElementById('sessionBox');
     const myStatusEl = document.getElementById('myStatus');
     const myAccountEl = document.getElementById('myAccount');
+    const mySourceEl = document.getElementById('mySource');
     const mySentEl = document.getElementById('mySent');
     const myErrorEl = document.getElementById('myError');
 
@@ -1246,6 +1429,7 @@ app.get('/', (_req, res) => {
       }
       sessionBox.style.display = 'block';
       myAccountEl.textContent = info.accountName || 'Подключено';
+      mySourceEl.textContent = info.tokenSource || '—';
       mySentEl.textContent = String(info.sentCount || 0);
       if (info.status === 'active') {
         myStatusEl.textContent = '🟢 Работает (Long Poll активен)';
@@ -1265,10 +1449,10 @@ app.get('/', (_req, res) => {
       }
     }
 
-    toggleVkBtn.addEventListener('click', () => {
-      const hidden = vkTokenInput.type === 'password';
-      vkTokenInput.type = hidden ? 'text' : 'password';
-      toggleVkBtn.textContent = hidden ? 'Скрыть' : 'Показать';
+    toggleCookieBtn.addEventListener('click', () => {
+      const hidden = vkCookieInput.type === 'password';
+      vkCookieInput.type = hidden ? 'text' : 'password';
+      toggleCookieBtn.textContent = hidden ? 'Скрыть' : 'Показать';
     });
 
     async function refreshStatus() {
@@ -1285,10 +1469,20 @@ app.get('/', (_req, res) => {
             srvStatusEl.textContent = '🔴 Ошибка (env)';
             srvStatusEl.style.color = '#FF453A';
           } else if (data.envBridge.status === 'active') {
-            srvStatusEl.textContent = '🟢 Работает (env)';
+            srvStatusEl.textContent = '🟢 Работает' + (data.envBridge.accountName ? ' (' + data.envBridge.accountName + ')' : '');
             srvStatusEl.style.color = '#30D158';
+          } else {
+            srvStatusEl.textContent = '🟡 Подключение…';
+            srvStatusEl.style.color = '#FF9F0A';
+          }
+          if (data.envBridge.error) {
+            envErrorBox.textContent = 'Ошибка автозапуска (VK_COOKIE из Environment Variables): ' + data.envBridge.error;
+            envErrorBox.style.display = 'block';
+          } else {
+            envErrorBox.style.display = 'none';
           }
         } else {
+          envErrorBox.style.display = 'none';
           srvStatusEl.textContent = data.activeBridges > 0 ? '🟢 Работает' : '🟡 Ожидает ключи';
           srvStatusEl.style.color = data.activeBridges > 0 ? '#30D158' : '#FF9F0A';
         }
@@ -1306,29 +1500,29 @@ app.get('/', (_req, res) => {
     refreshStatus();
 
     connectBtn.addEventListener('click', async () => {
-      const vkToken = vkTokenInput.value.trim();
+      const vkCookie = vkCookieInput.value.trim();
       const barkKey = barkKeyInput.value.trim();
-      if (!barkKey || !vkToken) {
-        setFeedback('Заполните оба поля: BARK_KEY и VK_TOKEN.', 'err');
+      if (!barkKey || !vkCookie) {
+        setFeedback('Заполните оба поля: BARK_KEY и VK_COOKIE.', 'err');
         return;
       }
       connectBtn.disabled = true;
-      connectBtn.textContent = 'Подключение…';
+      connectBtn.textContent = 'Получение web_token…';
       setFeedback('', '');
       try {
         const res = await fetch('/api/connect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ vkToken, barkKey }),
+          body: JSON.stringify({ vkCookie, barkKey }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) {
           throw new Error(data.error || 'Не удалось подключить уведомления');
         }
         currentSessionId = data.sessionId;
-        vkTokenInput.value = '';
+        vkCookieInput.value = '';
         renderMyBridge(data.myBridge);
-        setFeedback('Готово! Long Poll запущен. Новые сообщения из ВК сразу придут в Bark на ваш iPhone.', 'ok');
+        setFeedback('Готово! web_token получен и Long Poll запущен. Токен будет обновляться автоматически каждые 30 минут.', 'ok');
         refreshStatus();
       } catch (err) {
         setFeedback(err.message || 'Ошибка подключения', 'err');
@@ -1383,5 +1577,5 @@ app.get('/', (_req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`VK -> Bark Bridge запущен на http://0.0.0.0:${PORT}`);
+  console.log(`VK -> Bark Bridge (web_token) запущен на http://0.0.0.0:${PORT}`);
 });
