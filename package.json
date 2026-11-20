@@ -1,0 +1,19 @@
+{
+  "name": "vk-bark-bridge",
+  "version": "1.0.0",
+  "description": "Простой мост VK Long Poll -> Bark Push с переходом в приложение ВК (vk://)",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "build": "node --check index.js",
+    "lint": "node --check index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
